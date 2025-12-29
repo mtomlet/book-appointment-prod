@@ -7,6 +7,8 @@
  * PRODUCTION CREDENTIALS - DO NOT USE FOR TESTING
  * Location: Keep It Cut - Phoenix Encanto (201664)
  *
+ * Version: 1.0.1 - Deployed 2025-12-28
+ *
  * KEEP IT CUT SERVICES (Production IDs):
  * - Haircut Standard: f9160450-0b51-4ddc-bcc7-ac150103d5c0
  * - Haircut Skin Fade: 14000cb7-a5bb-4a26-9f23-b0f3016cc009
