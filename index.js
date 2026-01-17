@@ -7,9 +7,9 @@
  * PRODUCTION CREDENTIALS - DO NOT USE FOR TESTING
  * Location: Keep It Cut - Phoenix Encanto (201664)
  *
- * Version: 2.0.0 - FIXED: Add-ons now book correctly via sequential API calls
- *                  The Meevo API ignores AdditionalServiceIds parameter.
- *                  Add-ons are now booked as back-to-back services.
+ * Version: 2.1.0 - FIXED: Use correct Meevo parameter AddOnServiceIds
+ *                  (NOT AdditionalServiceIds - that was wrong)
+ *                  Single API call now books primary + add-ons correctly.
  *
  * KEEP IT CUT SERVICES (Production IDs):
  * - Haircut Standard: f9160450-0b51-4ddc-bcc7-ac150103d5c0
@@ -162,33 +162,6 @@ async function cancelStaleAppointment(authToken, clientId, serviceId, conflictDa
   }
 }
 
-// Helper: Book a single service
-async function bookSingleService(authToken, serviceId, startTime, clientId, employeeId) {
-  const bookingData = new URLSearchParams({
-    ServiceId: serviceId,
-    StartTime: startTime,
-    ClientId: clientId,
-    ClientGender: '2035'
-  });
-
-  if (employeeId) {
-    bookingData.append('EmployeeId', employeeId);
-  }
-
-  const response = await axios.post(
-    `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-    bookingData.toString(),
-    {
-      headers: {
-        Authorization: `Bearer ${authToken}`,
-        'Content-Type': 'application/x-www-form-urlencoded'
-      }
-    }
-  );
-
-  return response.data?.data || response.data;
-}
-
 app.post('/book', async (req, res) => {
   console.log('PRODUCTION Booking request received:', JSON.stringify(req.body));
 
@@ -214,138 +187,145 @@ app.post('/book', async (req, res) => {
 
     const authToken = await getToken();
 
-    // Track all booked services for response
-    const bookedServices = [];
+    // Build booking data
+    const bookingData = new URLSearchParams({
+      ServiceId: serviceId,
+      StartTime: datetime,
+      ClientId: client_id,
+      ClientGender: '2035'
+    });
 
-    // STEP 1: Book primary service
-    console.log('PRODUCTION: Booking primary service:', service);
-    let primaryResult;
-    try {
-      primaryResult = await bookSingleService(authToken, serviceId, datetime, client_id, stylist);
-      console.log('PRODUCTION: Primary service booked! ID:', primaryResult.appointmentId);
-      bookedServices.push({
-        service: service,
-        service_id: serviceId,
-        appointment_id: primaryResult.appointmentId,
-        appointment_service_id: primaryResult.appointmentServiceId,
-        start_time: primaryResult.startTime,
-        end_time: primaryResult.servicingEndTime
-      });
-    } catch (primaryError) {
-      const errorMessage = primaryError.response?.data?.error?.message || primaryError.message;
-
-      // Check for stale appointment conflict and try auto-recovery
-      const pastConflict = isPastAppointmentConflict(errorMessage);
-      if (pastConflict) {
-        console.log(`PRODUCTION: Stale appointment conflict detected. Attempting auto-recovery...`);
-        const cancelled = await cancelStaleAppointment(authToken, client_id, serviceId, pastConflict.date);
-        if (cancelled) {
-          primaryResult = await bookSingleService(authToken, serviceId, datetime, client_id, stylist);
-          console.log('PRODUCTION: Auto-recovery successful! Primary service booked.');
-          bookedServices.push({
-            service: service,
-            service_id: serviceId,
-            appointment_id: primaryResult.appointmentId,
-            appointment_service_id: primaryResult.appointmentServiceId,
-            start_time: primaryResult.startTime,
-            end_time: primaryResult.servicingEndTime,
-            auto_recovered: true
-          });
-        } else {
-          throw primaryError;
-        }
-      } else {
-        throw primaryError;
-      }
+    // Add stylist if provided
+    if (stylist) {
+      bookingData.append('EmployeeId', stylist);
     }
 
-    // STEP 2: Book add-on services SEQUENTIALLY (each starts when previous ends)
-    // NOTE: Meevo API ignores AdditionalServiceIds parameter, so we book each add-on separately
+    // Add add-on services using CORRECT Meevo parameter: AddOnServiceIds
+    // NOTE: The parameter is AddOnServiceIds, NOT AdditionalServiceIds
+    let resolvedAddons = [];
     if (additional_services && Array.isArray(additional_services) && additional_services.length > 0) {
-      console.log('PRODUCTION: Booking', additional_services.length, 'add-on service(s) sequentially...');
+      resolvedAddons = additional_services
+        .map(s => resolveServiceId(s))
+        .filter(s => s !== null);
 
-      let nextStartTime = primaryResult.servicingEndTime;
-
-      for (const addonName of additional_services) {
-        const addonServiceId = resolveServiceId(addonName);
-        if (!addonServiceId) {
-          console.log('PRODUCTION: Skipping invalid add-on:', addonName);
-          continue;
-        }
-
-        try {
-          console.log(`PRODUCTION: Booking add-on "${addonName}" starting at ${nextStartTime}`);
-          const addonResult = await bookSingleService(authToken, addonServiceId, nextStartTime, client_id, stylist);
-
-          console.log(`PRODUCTION: Add-on "${addonName}" booked! Ends at:`, addonResult.servicingEndTime);
-          bookedServices.push({
-            service: addonName,
-            service_id: addonServiceId,
-            appointment_id: addonResult.appointmentId,
-            appointment_service_id: addonResult.appointmentServiceId,
-            start_time: addonResult.startTime,
-            end_time: addonResult.servicingEndTime,
-            is_addon: true
-          });
-
-          // Next add-on starts when this one ends
-          nextStartTime = addonResult.servicingEndTime;
-
-        } catch (addonError) {
-          const addonErrorMsg = addonError.response?.data?.error?.message || addonError.message;
-          console.error(`PRODUCTION: Failed to book add-on "${addonName}":`, addonErrorMsg);
-
-          // Try auto-recovery for stale appointment conflicts on add-ons too
-          const pastConflict = isPastAppointmentConflict(addonErrorMsg);
-          if (pastConflict) {
-            const cancelled = await cancelStaleAppointment(authToken, client_id, addonServiceId, pastConflict.date);
-            if (cancelled) {
-              try {
-                const retryResult = await bookSingleService(authToken, addonServiceId, nextStartTime, client_id, stylist);
-                console.log(`PRODUCTION: Add-on "${addonName}" booked after auto-recovery!`);
-                bookedServices.push({
-                  service: addonName,
-                  service_id: addonServiceId,
-                  appointment_id: retryResult.appointmentId,
-                  appointment_service_id: retryResult.appointmentServiceId,
-                  start_time: retryResult.startTime,
-                  end_time: retryResult.servicingEndTime,
-                  is_addon: true,
-                  auto_recovered: true
-                });
-                nextStartTime = retryResult.servicingEndTime;
-              } catch (retryErr) {
-                console.error(`PRODUCTION: Add-on "${addonName}" failed even after auto-recovery`);
-                // Continue with other add-ons
-              }
-            }
-          }
-          // Continue booking other add-ons even if one fails
-        }
+      if (resolvedAddons.length > 0) {
+        // Use AddOnServiceIds - the correct Meevo parameter name
+        bookingData.append('AddOnServiceIds', resolvedAddons.join(','));
+        console.log('PRODUCTION: Adding add-on services via AddOnServiceIds:', resolvedAddons);
       }
     }
 
-    // Build response
-    const primaryAppointmentId = bookedServices[0]?.appointment_id;
-    const totalServicesBooked = bookedServices.length;
-    const addonsBooked = bookedServices.filter(s => s.is_addon).length;
+    console.log('PRODUCTION Booking payload:', bookingData.toString());
 
-    console.log(`PRODUCTION: Booking complete! ${totalServicesBooked} service(s) booked.`);
+    const bookRes = await axios.post(
+      `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+      bookingData.toString(),
+      {
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+          'Content-Type': 'application/x-www-form-urlencoded'
+        }
+      }
+    );
+
+    const data = bookRes.data?.data || bookRes.data;
+    const appointmentId = data.appointmentId;
+    const addOnServiceIds = data.addOnServiceIds || [];
+
+    console.log('PRODUCTION Booking successful!');
+    console.log('  Appointment ID:', appointmentId);
+    console.log('  Primary service ends at:', data.servicingEndTime);
+    console.log('  Add-on services booked:', addOnServiceIds.length);
 
     res.json({
       success: true,
-      appointment_id: primaryAppointmentId,
+      appointment_id: appointmentId,
+      appointment_service_id: data.appointmentServiceId,
       service_id: serviceId,
-      total_services_booked: totalServicesBooked,
-      booked_services: bookedServices,
-      message: addonsBooked > 0
-        ? `Appointment booked successfully with ${addonsBooked} add-on service(s)`
+      start_time: data.startTime,
+      end_time: data.servicingEndTime,
+      add_on_service_ids: addOnServiceIds,
+      message: addOnServiceIds.length > 0
+        ? `Appointment booked successfully with ${addOnServiceIds.length} add-on service(s)`
         : 'Appointment booked successfully'
     });
 
   } catch (error) {
     const errorMessage = error.response?.data?.error?.message || error.message;
     console.error('PRODUCTION Booking error:', errorMessage);
+
+    // Check if this is a stale past appointment conflict
+    const pastConflict = isPastAppointmentConflict(errorMessage);
+
+    if (pastConflict) {
+      console.log(`PRODUCTION: Detected stale past appointment conflict (${pastConflict.month}/${pastConflict.day}/${pastConflict.year}). Attempting auto-recovery...`);
+
+      const authToken = await getToken();
+      const serviceId = resolveServiceId(req.body.service);
+      const cancelled = await cancelStaleAppointment(authToken, req.body.client_id, serviceId, pastConflict.date);
+
+      if (cancelled) {
+        // Retry the booking
+        console.log('PRODUCTION: Retrying booking after cancelling stale appointment...');
+
+        try {
+          const bookingData = new URLSearchParams({
+            ServiceId: serviceId,
+            StartTime: req.body.datetime,
+            ClientId: req.body.client_id,
+            ClientGender: '2035'
+          });
+
+          if (req.body.stylist) {
+            bookingData.append('EmployeeId', req.body.stylist);
+          }
+
+          // Add add-ons with correct parameter name
+          if (req.body.additional_services && Array.isArray(req.body.additional_services)) {
+            const resolvedAddons = req.body.additional_services
+              .map(s => resolveServiceId(s))
+              .filter(s => s !== null);
+            if (resolvedAddons.length > 0) {
+              bookingData.append('AddOnServiceIds', resolvedAddons.join(','));
+            }
+          }
+
+          const retryRes = await axios.post(
+            `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+            bookingData.toString(),
+            {
+              headers: {
+                Authorization: `Bearer ${authToken}`,
+                'Content-Type': 'application/x-www-form-urlencoded'
+              }
+            }
+          );
+
+          const data = retryRes.data?.data || retryRes.data;
+          console.log('PRODUCTION: Retry successful! Appointment ID:', data.appointmentId);
+
+          return res.json({
+            success: true,
+            appointment_id: data.appointmentId,
+            appointment_service_id: data.appointmentServiceId,
+            service_id: serviceId,
+            start_time: data.startTime,
+            end_time: data.servicingEndTime,
+            add_on_service_ids: data.addOnServiceIds || [],
+            message: 'Appointment booked successfully (auto-recovered from stale past appointment)',
+            auto_recovered: true
+          });
+
+        } catch (retryError) {
+          console.error('PRODUCTION: Retry also failed:', retryError.response?.data || retryError.message);
+          return res.json({
+            success: false,
+            error: retryError.response?.data?.error?.message || retryError.message,
+            note: 'Auto-recovery attempted but retry failed'
+          });
+        }
+      }
+    }
 
     res.json({
       success: false,
@@ -362,8 +342,8 @@ app.get('/health', (req, res) => {
     location: 'Phoenix Encanto',
     location_id: CONFIG.LOCATION_ID,
     service: 'Book Appointment',
-    version: '2.0.0',
-    fix_notes: 'Add-ons now book correctly via sequential API calls'
+    version: '2.1.0',
+    fix_notes: 'Uses correct Meevo parameter AddOnServiceIds (not AdditionalServiceIds)'
   });
 });
 
@@ -388,8 +368,8 @@ app.get('/services', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\nPRODUCTION Book Appointment Server v2.0.0`);
+  console.log(`\nPRODUCTION Book Appointment Server v2.1.0`);
   console.log(`Location: Phoenix Encanto (${CONFIG.LOCATION_ID})`);
-  console.log(`FIX: Add-ons now book correctly via sequential API calls`);
+  console.log(`FIX: Uses correct Meevo parameter AddOnServiceIds`);
   console.log(`Listening on port ${PORT}\n`);
 });
