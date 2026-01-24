@@ -7,9 +7,10 @@
  * PRODUCTION CREDENTIALS - DO NOT USE FOR TESTING
  * Location: Keep It Cut - Phoenix Encanto (201664)
  *
- * Version: 2.1.0 - FIXED: Use correct Meevo parameter AddOnServiceIds
- *                  (NOT AdditionalServiceIds - that was wrong)
- *                  Single API call now books primary + add-ons correctly.
+ * Version: 3.0.0 - FIXED: Book addons as separate API calls with AppointmentId
+ *                  The AddOnServiceIds parameter does NOT work - Meevo echoes it
+ *                  back but doesn't actually book the addons. Must book each
+ *                  addon as a separate POST with the same AppointmentId.
  *
  * KEEP IT CUT SERVICES (Production IDs):
  * - Haircut Standard: f9160450-0b51-4ddc-bcc7-ac150103d5c0
@@ -187,55 +188,87 @@ app.post('/book', async (req, res) => {
 
     const authToken = await getToken();
 
-    // Build booking data
-    const bookingData = new URLSearchParams({
-      ServiceId: serviceId,
-      StartTime: datetime,
-      ClientId: client_id,
-      ClientGender: '2035'
-    });
-
-    // Add stylist if provided
-    if (stylist) {
-      bookingData.append('EmployeeId', stylist);
-    }
-
-    // Add add-on services using CORRECT Meevo parameter: AddOnServiceIds
-    // NOTE: The parameter is AddOnServiceIds, NOT AdditionalServiceIds
+    // Resolve addon service IDs
     let resolvedAddons = [];
     if (additional_services && Array.isArray(additional_services) && additional_services.length > 0) {
       resolvedAddons = additional_services
         .map(s => resolveServiceId(s))
         .filter(s => s !== null);
-
-      if (resolvedAddons.length > 0) {
-        // Use AddOnServiceIds - the correct Meevo parameter name
-        bookingData.append('AddOnServiceIds', resolvedAddons.join(','));
-        console.log('PRODUCTION: Adding add-on services via AddOnServiceIds:', resolvedAddons);
-      }
     }
 
-    console.log('PRODUCTION Booking payload:', bookingData.toString());
+    // Step 1: Book primary service
+    console.log('PRODUCTION: Booking primary service...');
+    const primaryBooking = {
+      ServiceId: serviceId,
+      StartTime: datetime,
+      ClientId: client_id
+    };
+    if (stylist) {
+      primaryBooking.EmployeeId = stylist;
+    }
 
     const bookRes = await axios.post(
       `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-      bookingData.toString(),
+      primaryBooking,
       {
         headers: {
           Authorization: `Bearer ${authToken}`,
-          'Content-Type': 'application/x-www-form-urlencoded'
+          'Content-Type': 'application/json'
         }
       }
     );
 
     const data = bookRes.data?.data || bookRes.data;
     const appointmentId = data.appointmentId;
-    const addOnServiceIds = data.addOnServiceIds || [];
+    let lastEndTime = data.bookingEndTime;
+    const bookedAddons = [];
 
-    console.log('PRODUCTION Booking successful!');
+    console.log('PRODUCTION: Primary service booked');
     console.log('  Appointment ID:', appointmentId);
-    console.log('  Primary service ends at:', data.servicingEndTime);
-    console.log('  Add-on services booked:', addOnServiceIds.length);
+    console.log('  Ends at:', lastEndTime);
+
+    // Step 2: Book each addon as separate call with same AppointmentId
+    if (resolvedAddons.length > 0) {
+      console.log('PRODUCTION: Booking', resolvedAddons.length, 'addon(s)...');
+
+      for (const addonId of resolvedAddons) {
+        try {
+          // Parse end time to use as start time for addon
+          const addonStartTime = lastEndTime.split('.')[0]; // Remove milliseconds
+
+          const addonBooking = {
+            ServiceId: addonId,
+            StartTime: addonStartTime,
+            ClientId: client_id,
+            AppointmentId: appointmentId
+          };
+          if (stylist) {
+            addonBooking.EmployeeId = stylist;
+          }
+
+          const addonRes = await axios.post(
+            `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+            addonBooking,
+            {
+              headers: {
+                Authorization: `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+              }
+            }
+          );
+
+          const addonData = addonRes.data?.data || addonRes.data;
+          bookedAddons.push(addonId);
+          lastEndTime = addonData.bookingEndTime;
+          console.log('  Addon booked:', addonId, '| Ends:', lastEndTime);
+        } catch (addonError) {
+          console.error('  Addon failed:', addonId, '-', addonError.response?.data?.error?.message || addonError.message);
+        }
+      }
+    }
+
+    console.log('PRODUCTION Booking complete!');
+    console.log('  Total services:', 1 + bookedAddons.length);
 
     res.json({
       success: true,
@@ -243,10 +276,10 @@ app.post('/book', async (req, res) => {
       appointment_service_id: data.appointmentServiceId,
       service_id: serviceId,
       start_time: data.startTime,
-      end_time: data.servicingEndTime,
-      add_on_service_ids: addOnServiceIds,
-      message: addOnServiceIds.length > 0
-        ? `Appointment booked successfully with ${addOnServiceIds.length} add-on service(s)`
+      end_time: lastEndTime,
+      add_on_service_ids: bookedAddons,
+      message: bookedAddons.length > 0
+        ? `Appointment booked successfully with ${bookedAddons.length} add-on service(s)`
         : 'Appointment booked successfully'
     });
 
@@ -265,53 +298,85 @@ app.post('/book', async (req, res) => {
       const cancelled = await cancelStaleAppointment(authToken, req.body.client_id, serviceId, pastConflict.date);
 
       if (cancelled) {
-        // Retry the booking
+        // Retry the booking with proper addon handling
         console.log('PRODUCTION: Retrying booking after cancelling stale appointment...');
 
         try {
-          const bookingData = new URLSearchParams({
-            ServiceId: serviceId,
-            StartTime: req.body.datetime,
-            ClientId: req.body.client_id,
-            ClientGender: '2035'
-          });
-
-          if (req.body.stylist) {
-            bookingData.append('EmployeeId', req.body.stylist);
-          }
-
-          // Add add-ons with correct parameter name
+          // Resolve addons
+          let retryAddons = [];
           if (req.body.additional_services && Array.isArray(req.body.additional_services)) {
-            const resolvedAddons = req.body.additional_services
+            retryAddons = req.body.additional_services
               .map(s => resolveServiceId(s))
               .filter(s => s !== null);
-            if (resolvedAddons.length > 0) {
-              bookingData.append('AddOnServiceIds', resolvedAddons.join(','));
-            }
+          }
+
+          // Book primary service
+          const primaryBooking = {
+            ServiceId: serviceId,
+            StartTime: req.body.datetime,
+            ClientId: req.body.client_id
+          };
+          if (req.body.stylist) {
+            primaryBooking.EmployeeId = req.body.stylist;
           }
 
           const retryRes = await axios.post(
             `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-            bookingData.toString(),
+            primaryBooking,
             {
               headers: {
                 Authorization: `Bearer ${authToken}`,
-                'Content-Type': 'application/x-www-form-urlencoded'
+                'Content-Type': 'application/json'
               }
             }
           );
 
           const data = retryRes.data?.data || retryRes.data;
-          console.log('PRODUCTION: Retry successful! Appointment ID:', data.appointmentId);
+          const retryAptId = data.appointmentId;
+          let retryEndTime = data.bookingEndTime;
+          const retryBookedAddons = [];
+
+          console.log('PRODUCTION: Retry primary booked, ID:', retryAptId);
+
+          // Book addons
+          for (const addonId of retryAddons) {
+            try {
+              const addonStartTime = retryEndTime.split('.')[0];
+              const addonBooking = {
+                ServiceId: addonId,
+                StartTime: addonStartTime,
+                ClientId: req.body.client_id,
+                AppointmentId: retryAptId
+              };
+              if (req.body.stylist) {
+                addonBooking.EmployeeId = req.body.stylist;
+              }
+
+              const addonRes = await axios.post(
+                `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+                addonBooking,
+                {
+                  headers: {
+                    Authorization: `Bearer ${authToken}`,
+                    'Content-Type': 'application/json'
+                  }
+                }
+              );
+              retryBookedAddons.push(addonId);
+              retryEndTime = addonRes.data?.data?.bookingEndTime || retryEndTime;
+            } catch (addonErr) {
+              console.error('PRODUCTION: Retry addon failed:', addonId);
+            }
+          }
 
           return res.json({
             success: true,
-            appointment_id: data.appointmentId,
+            appointment_id: retryAptId,
             appointment_service_id: data.appointmentServiceId,
             service_id: serviceId,
             start_time: data.startTime,
-            end_time: data.servicingEndTime,
-            add_on_service_ids: data.addOnServiceIds || [],
+            end_time: retryEndTime,
+            add_on_service_ids: retryBookedAddons,
             message: 'Appointment booked successfully (auto-recovered from stale past appointment)',
             auto_recovered: true
           });
